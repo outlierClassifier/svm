@@ -20,8 +20,15 @@ use crate::signals::SignalType;
 static mut START_TIME: Option<Instant> = None;
 const MODEL_PATH: &str = "trained_svm_model.json";
 
+struct TrainingSession {
+    total_discharges: usize,
+    discharges: Vec<Discharge>,
+}
+
 struct AppState {
     model: RwLock<Option<Svm<f64, bool>>>,
+    training: RwLock<Option<TrainingSession>>,
+    last_training: RwLock<Option<DateTime<Utc>>>,
 }
 
 impl AppState {
@@ -45,65 +52,65 @@ impl AppState {
         *self.model.write().unwrap() = Some(model);
         log::info!("Model loaded successfully from {}", path);
         Ok(())
-    }    
+    }
 }
 
 // Data structures based on API schema
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Signal {
-    #[serde(rename = "fileName")]
-    file_name: String,
+    #[serde(rename = "filename")]
+    filename: String,
     values: Vec<f64>,
-    #[serde(default)]
-    _times: Vec<f64>,
-    #[serde(default)]
-    _length: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Discharge {
+    #[allow(dead_code)]
     id: String,
-    #[serde(default)]
-    _times: Vec<f64>,
-    #[serde(default)]
-    _length: usize,
+    #[allow(dead_code)]
+    times: Vec<f64>,
+    #[allow(dead_code)]
+    length: usize,
     #[serde(default, rename = "anomalyTime")]
     anomaly_time: Option<f64>,
     signals: Vec<Signal>,
 }
 
 #[derive(Deserialize)]
-struct PredictionRequest {
-    discharges: Vec<Discharge>,
+struct StartTrainingRequest {
+    #[serde(rename = "totalDischarges")]
+    total_discharges: usize,
+    #[serde(rename = "timeoutSeconds")]
+    #[allow(dead_code)]
+    timeout_seconds: usize,
 }
 
 #[derive(Serialize)]
+struct StartTrainingResponse {
+    #[serde(rename = "expectedDischarges")]
+    expected_discharges: usize,
+}
+
+#[derive(Serialize)]
+struct DischargeAck {
+    ordinal: usize,
+    #[serde(rename = "totalDischarges")]
+    total_discharges: usize,
+}
+
+
+#[derive(Serialize)]
 struct PredictionResponse {
-    prediction: i32,
+    prediction: String,
     confidence: f64,
     #[serde(rename = "executionTimeMs")]
     execution_time_ms: f64,
     model: String,
-    details: serde_json::Value,
 }
 
 #[derive(Deserialize)]
-struct TrainingOptions {
-    #[serde(default)]
-    _epochs: Option<i32>,
-    #[serde(default, rename = "batchSize")]
-    _batch_size: Option<i32>,
-    #[serde(default)]
-    _hyperparameters: Option<serde_json::Value>,
-}
 
-#[derive(Deserialize)]
-struct TrainingRequest {
-    discharges: Vec<Discharge>,
-    #[serde(default)]
-    _options: Option<TrainingOptions>,
-}
 
 #[derive(Serialize)]
 struct TrainingMetrics {
@@ -125,18 +132,9 @@ struct TrainingResponse {
 }
 
 #[derive(Serialize)]
-struct MemoryInfo {
-    total: f64,
-    used: f64,
-}
-
-#[derive(Serialize)]
 struct HealthCheckResponse {
-    status: String,
-    version: String,
+    name: String,
     uptime: f64,
-    memory: MemoryInfo,
-    load: f64,
     #[serde(rename = "lastTraining")]
     last_training: String,
 }
@@ -178,9 +176,9 @@ fn api_signal_to_internal(
     signal_class: DisruptionClass,
 ) -> Result<InternalSignal, String> {
     // Obtener el tipo de señal a partir del nombre del archivo
-    let signal_type = get_discharge_type_from_file_name(&api_signal.file_name)?;
+    let signal_type = get_discharge_type_from_file_name(&api_signal.filename)?;
     Ok(InternalSignal::new(
-        api_signal.file_name.clone(),
+        api_signal.filename.clone(),
         api_signal.values.clone(),
         signal_class,
         signal_type,
@@ -209,7 +207,7 @@ fn api_discharge_to_internal_signals(discharge: &Discharge) -> Vec<InternalSigna
 
 /// Procesa una petición de predicción
 fn process_prediction_request(
-    request: &PredictionRequest,
+    discharge: &Discharge,
     model: &Option<Svm<f64, bool>>,
 ) -> PredictionResponse {
     let start_time = Instant::now();
@@ -217,20 +215,17 @@ fn process_prediction_request(
     // Si no hay modelo entrenado, devolver respuesta por defecto
     if model.is_none() {
         return PredictionResponse {
-            prediction: -1,
+            prediction: "Unknown".to_string(),
             confidence: 0.0,
             execution_time_ms: 0.0,
             model: "none".to_string(),
-            details: serde_json::json!({ "error": "No hay modelo entrenado" }),
         };
     }
 
-    let discharges = request.discharges.iter().map(|d| {
-        InternalDischarge::new(
-            DisruptionClass::Unknown, // La clase es desconocida en predicción
-            api_discharge_to_internal_signals(d),
-        )
-    }).collect::<Vec<_>>();
+    let discharges = vec![InternalDischarge::new(
+        DisruptionClass::Unknown,
+        api_discharge_to_internal_signals(discharge),
+    )];
     
     let dataset = get_dataset(discharges);
     
@@ -243,26 +238,22 @@ fn process_prediction_request(
     let total = predictions.len();
     let confidence = if total > 0 { anomaly_count as f64 / total as f64 } else { 0.0 };
     
-    let prediction = if confidence > 0.5 { 1 } else { 0 };
+    let prediction = if confidence > 0.5 { "Anomaly" } else { "Normal" };
     
     PredictionResponse {
-        prediction,
+        prediction: prediction.to_string(),
         confidence,
         execution_time_ms: start_time.elapsed().as_millis() as f64,
         model: "svm".to_string(),
-        details: serde_json::json!({
-            "anomalyRatio": confidence
-        }),
     }
 }
 
 /// Procesa una petición de entrenamiento
-fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm<f64, bool>) {
+fn process_training_request(discharges: &[Discharge]) -> (TrainingResponse, Svm<f64, bool>) {
     // Convertir todas las descargas y señales al formato interno
     let start_time = Instant::now();
 
-    let discharges = request
-        .discharges
+    let discharges = discharges
         .iter()
         .map(|d| {
             InternalDischarge::new(
@@ -316,7 +307,7 @@ fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm
 
 #[post("/predict")]
 async fn predict(
-    req: web::Json<PredictionRequest>,
+    req: web::Json<Discharge>,
     app_state: web::Data<AppState>,
 ) -> impl Responder {
     let model = app_state.model.read().unwrap();
@@ -325,28 +316,49 @@ async fn predict(
 }
 
 #[post("/train")]
-async fn train(req: web::Json<TrainingRequest>, app_state: web::Data<AppState>) -> impl Responder {
-    println!("Received training petition");
-    let (response, model) = process_training_request(&req);
-
-    {
-        let mut model_lock: std::sync::RwLockWriteGuard<'_, Option<Svm<f64, bool>>> = app_state.model.write().unwrap();
-        *model_lock = Some(model);
-    } // When model_lock goes out of scope, the lock is released
-
-    // Save the trained model to a file
-    let model_path = MODEL_PATH;
-    let res = app_state.save_model_json(model_path);
-    
-    if res.is_err() {
-        log::warn!("Unable to save model")
+async fn start_training(req: web::Json<StartTrainingRequest>, app_state: web::Data<AppState>) -> impl Responder {
+    let mut training_lock = app_state.training.write().unwrap();
+    if training_lock.is_some() {
+        return HttpResponse::ServiceUnavailable().finish();
     }
+    let session = TrainingSession {
+        total_discharges: req.total_discharges,
+        discharges: Vec::with_capacity(req.total_discharges),
+    };
+    *training_lock = Some(session);
+    HttpResponse::Ok().json(StartTrainingResponse { expected_discharges: req.total_discharges })
+}
 
-    HttpResponse::Ok().json(response)
+#[post("/train/{ordinal}")]
+async fn push_discharge(path: web::Path<usize>, req: web::Json<Discharge>, app_state: web::Data<AppState>) -> impl Responder {
+    let ordinal = path.into_inner();
+    let mut training_lock = app_state.training.write().unwrap();
+    if let Some(session) = training_lock.as_mut() {
+        if ordinal != session.discharges.len() + 1 || ordinal > session.total_discharges {
+            return HttpResponse::BadRequest().finish();
+        }
+        session.discharges.push(req.into_inner());
+        let total = session.total_discharges;
+        if ordinal == total {
+            let discharges = training_lock.take().unwrap().discharges;
+            drop(training_lock);
+            let (_response, model) = process_training_request(&discharges);
+            {
+                let mut model_lock = app_state.model.write().unwrap();
+                *model_lock = Some(model);
+            }
+            let _ = app_state.save_model_json(MODEL_PATH);
+            *app_state.last_training.write().unwrap() = Some(Utc::now());
+            // TODO: send webhook with `response`
+            return HttpResponse::Ok().json(DischargeAck { ordinal, total_discharges: total });
+        }
+        return HttpResponse::Ok().json(DischargeAck { ordinal, total_discharges: total });
+    }
+    HttpResponse::ServiceUnavailable().finish()
 }
 
 #[get("/health")]
-async fn health_check() -> impl Responder {
+async fn health_check(app_state: web::Data<AppState>) -> impl Responder {
     // Calculate uptime in seconds
     let uptime = unsafe {
         if let Some(start_time) = START_TIME {
@@ -358,19 +370,17 @@ async fn health_check() -> impl Responder {
 
     println!("Received heartbeat at {uptime}");
 
-    // Current date-time in ISO format
-    let now: DateTime<Utc> = Utc::now();
+    let last_training = app_state
+        .last_training
+        .read()
+        .unwrap()
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "never".to_string());
 
     let response = HealthCheckResponse {
-        status: "online".to_string(),
-        version: "1.0.0".to_string(),
+        name: "svm".to_string(),
         uptime,
-        memory: MemoryInfo {
-            total: 1024.0,
-            used: 512.0,
-        },
-        load: 0.3,
-        last_training: now.to_rfc3339(),
+        last_training,
     };
 
     HttpResponse::Ok().json(response)
@@ -388,6 +398,8 @@ async fn main() -> std::io::Result<()> {
 
     let app_state = web::Data::new(AppState {
         model: RwLock::new(None),
+        training: RwLock::new(None),
+        last_training: RwLock::new(None),
     });
 
     // Try to load model
@@ -413,12 +425,15 @@ async fn main() -> std::io::Result<()> {
 
 
     // Start the health check server in a separate thread
-    std::thread::spawn(|| {
+    let health_data = app_state.clone();
+    std::thread::spawn(move || {
         // Use the system runtime for the health check server
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            HttpServer::new(|| {
-                App::new().service(health_check)
+            HttpServer::new(move || {
+                App::new()
+                    .app_data(health_data.clone())
+                    .service(health_check)
             })
             .workers(1) // Use only one worker for health checks
             .bind(("0.0.0.0", 3001))
@@ -435,7 +450,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state.clone())
             .app_data(json_config.clone())  // Aplicar configuración de tamaño JSON
             .service(predict)
-            .service(train)
+            .service(start_training)
+            .service(push_discharge)
     })
     .bind(("0.0.0.0", 8001))?
     .run()
