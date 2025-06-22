@@ -2,6 +2,8 @@ mod signals;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono::{DateTime, Utc};
+use log::info;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use signals::get_dataset;
 use std::sync::RwLock;
@@ -19,6 +21,7 @@ use crate::signals::SignalType;
 // Startup time for uptime calculation
 static mut START_TIME: Option<Instant> = None;
 const MODEL_PATH: &str = "trained_svm_model.json";
+const WEBHOOK_URL_TRAINING_COMPLETED: &str = "http://localhost:3000/trainingCompleted";
 
 struct TrainingSession {
     total_discharges: usize,
@@ -29,6 +32,7 @@ struct AppState {
     model: RwLock<Option<Svm<f64, bool>>>,
     training: RwLock<Option<TrainingSession>>,
     last_training: RwLock<Option<DateTime<Utc>>>,
+    http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -36,7 +40,8 @@ impl AppState {
         let model = self.model.read().unwrap();
         if let Some(model) = &*model {
             let json = serde_json::to_string(model)?;
-            std::fs::write(path, json).map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
+            std::fs::write(path, json)
+                .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
         } else {
             return Err(anyhow::anyhow!("No model to save"));
         }
@@ -52,6 +57,34 @@ impl AppState {
         *self.model.write().unwrap() = Some(model);
         log::info!("Model loaded successfully from {}", path);
         Ok(())
+    }
+
+    /// Send webhook notification about training completion
+    async fn send_training_webhook(&self, response: &TrainingResponse) {
+        log::info!(
+            "Sending training completion webhook to: {}",
+            WEBHOOK_URL_TRAINING_COMPLETED
+        );
+
+        match self
+            .http_client
+            .post(WEBHOOK_URL_TRAINING_COMPLETED)
+            .json(response)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    log::info!("Webhook sent successfully, status: {}", resp.status());
+                } else {
+                    log::warn!("Webhook failed with status: {}", resp.status());
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to send webhook: {}", e);
+            }
+        }
     }
 }
 
@@ -99,7 +132,6 @@ struct DischargeAck {
     total_discharges: usize,
 }
 
-
 #[derive(Serialize)]
 struct PredictionResponse {
     prediction: String,
@@ -110,9 +142,7 @@ struct PredictionResponse {
 }
 
 #[derive(Deserialize)]
-
-
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TrainingMetrics {
     accuracy: f64,
     loss: f64,
@@ -120,7 +150,7 @@ struct TrainingMetrics {
     f1_score: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TrainingResponse {
     status: String,
     message: String,
@@ -162,7 +192,7 @@ fn get_discharge_type_from_file_name(file_name: &str) -> Result<SignalType, Stri
         _ => return Err(format!("Unknown signal type: {}", signal_type_int)),
     };
 
-    println!(
+    log::debug!(
         "Detected file name: {} with signal type: {:?}",
         file_name, signal_type
     );
@@ -211,9 +241,14 @@ fn process_prediction_request(
     model: &Option<Svm<f64, bool>>,
 ) -> PredictionResponse {
     let start_time = Instant::now();
+    log::info!(
+        "Received prediction request for discharge ID: {}",
+        discharge.id
+    );
     
-    // Si no hay modelo entrenado, devolver respuesta por defecto
+    // If no model is loaded, return unknown prediction
     if model.is_none() {
+        log::warn!("No model loaded, returning unknown prediction");
         return PredictionResponse {
             prediction: "Unknown".to_string(),
             confidence: 0.0,
@@ -226,20 +261,27 @@ fn process_prediction_request(
         DisruptionClass::Unknown,
         api_discharge_to_internal_signals(discharge),
     )];
-    
+
     let dataset = get_dataset(discharges);
-    
+
     // Realizar predicción con el modelo
-    let predictions = model.as_ref().unwrap()
-        .predict(&dataset);
-    
+    let predictions = model.as_ref().unwrap().predict(&dataset);
+
     // Determinar si hay anomalía (true representa anomalía)
     let anomaly_count = predictions.iter().filter(|&&p| p).count();
     let total = predictions.len();
-    let confidence = if total > 0 { anomaly_count as f64 / total as f64 } else { 0.0 };
-    
-    let prediction = if confidence > 0.5 { "Anomaly" } else { "Normal" };
-    
+    let confidence = if total > 0 {
+        anomaly_count as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    let prediction = if confidence > 0.5 {
+        "Anomaly"
+    } else {
+        "Normal"
+    };
+
     PredictionResponse {
         prediction: prediction.to_string(),
         confidence,
@@ -306,19 +348,24 @@ fn process_training_request(discharges: &[Discharge]) -> (TrainingResponse, Svm<
 // API endpoints
 
 #[post("/predict")]
-async fn predict(
-    req: web::Json<Discharge>,
-    app_state: web::Data<AppState>,
-) -> impl Responder {
+async fn predict(req: web::Json<Discharge>, app_state: web::Data<AppState>) -> impl Responder {
     let model = app_state.model.read().unwrap();
     let response = process_prediction_request(&req, &model);
     HttpResponse::Ok().json(response)
 }
 
 #[post("/train")]
-async fn start_training(req: web::Json<StartTrainingRequest>, app_state: web::Data<AppState>) -> impl Responder {
+async fn start_training(
+    req: web::Json<StartTrainingRequest>,
+    app_state: web::Data<AppState>,
+) -> impl Responder {
+    info!(
+        "Received training request for {} discharges",
+        req.total_discharges
+    );
     let mut training_lock = app_state.training.write().unwrap();
     if training_lock.is_some() {
+        warn!("Training session already in progress, rejecting new request");
         return HttpResponse::ServiceUnavailable().finish();
     }
     let session = TrainingSession {
@@ -326,11 +373,18 @@ async fn start_training(req: web::Json<StartTrainingRequest>, app_state: web::Da
         discharges: Vec::with_capacity(req.total_discharges),
     };
     *training_lock = Some(session);
-    HttpResponse::Ok().json(StartTrainingResponse { expected_discharges: req.total_discharges })
+    HttpResponse::Ok().json(StartTrainingResponse {
+        expected_discharges: req.total_discharges,
+    })
 }
 
 #[post("/train/{ordinal}")]
-async fn push_discharge(path: web::Path<usize>, req: web::Json<Discharge>, app_state: web::Data<AppState>) -> impl Responder {
+async fn push_discharge(
+    path: web::Path<usize>,
+    req: web::Json<Discharge>,
+    app_state: web::Data<AppState>,
+) -> impl Responder {
+    println!("Received discharge for training: {:?}", req.id);
     let ordinal = path.into_inner();
     let mut training_lock = app_state.training.write().unwrap();
     if let Some(session) = training_lock.as_mut() {
@@ -342,17 +396,30 @@ async fn push_discharge(path: web::Path<usize>, req: web::Json<Discharge>, app_s
         if ordinal == total {
             let discharges = training_lock.take().unwrap().discharges;
             drop(training_lock);
-            let (_response, model) = process_training_request(&discharges);
+            let (response, model) = process_training_request(&discharges);
             {
                 let mut model_lock = app_state.model.write().unwrap();
                 *model_lock = Some(model);
             }
             let _ = app_state.save_model_json(MODEL_PATH);
             *app_state.last_training.write().unwrap() = Some(Utc::now());
-            // TODO: send webhook with `response`
-            return HttpResponse::Ok().json(DischargeAck { ordinal, total_discharges: total });
+
+            // Send webhook with training response
+            let app_state_clone = app_state.clone();
+            let response_clone = response.clone();
+            tokio::spawn(async move {
+                app_state_clone.send_training_webhook(&response_clone).await;
+            });
+
+            return HttpResponse::Ok().json(DischargeAck {
+                ordinal,
+                total_discharges: total,
+            });
         }
-        return HttpResponse::Ok().json(DischargeAck { ordinal, total_discharges: total });
+        return HttpResponse::Ok().json(DischargeAck {
+            ordinal,
+            total_discharges: total,
+        });
     }
     HttpResponse::ServiceUnavailable().finish()
 }
@@ -400,6 +467,7 @@ async fn main() -> std::io::Result<()> {
         model: RwLock::new(None),
         training: RwLock::new(None),
         last_training: RwLock::new(None),
+        http_client: reqwest::Client::new(),
     });
 
     // Try to load model
@@ -410,19 +478,19 @@ async fn main() -> std::io::Result<()> {
     }
 
     let json_config = web::JsonConfig::default()
-        .limit(1 << 26)  // Tamaño max de 2^26 bytes (64 MB)
+        .limit(1 << 26) // Tamaño max de 2^26 bytes (64 MB)
         .error_handler(|err, _req| {
             log::error!("JSON payload error: {}", err);
             actix_web::error::InternalError::from_response(
-                err, 
+                err,
                 HttpResponse::BadRequest()
-                    .json(serde_json::json!({"error": "Payload too large or malformed"}))
-            ).into()
+                    .json(serde_json::json!({"error": "Payload too large or malformed"})),
+            )
+            .into()
         });
 
     log::info!("Starting SVM model server on http://0.0.0.0:8001");
     log::info!("Health check server on http://0.0.0.0:3001");
-
 
     // Start the health check server in a separate thread
     let health_data = app_state.clone();
@@ -448,7 +516,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .app_data(json_config.clone())  // Aplicar configuración de tamaño JSON
+            .app_data(json_config.clone()) // Aplicar configuración de tamaño JSON
             .service(predict)
             .service(start_training)
             .service(push_discharge)
