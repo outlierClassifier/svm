@@ -3,7 +3,7 @@ mod signals;
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use signals::{get_dataset, NormalizationParams};
+use signals::{NormalizationParams, get_dataset};
 use std::sync::RwLock;
 use std::time::Instant;
 use uuid::Uuid;
@@ -22,7 +22,13 @@ const MODEL_PATH: &str = "trained_svm_model.json";
 
 struct AppState {
     model: RwLock<Option<Svm<f64, bool>>>,
-    norm_params: RwLock<Option<NormalizationParams>>, 
+    norm_params: RwLock<Option<NormalizationParams>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedState {
+    model: Svm<f64, bool>,
+    params: NormalizationParams,
 }
 
 impl AppState {
@@ -30,12 +36,13 @@ impl AppState {
         let model_guard = self.model.read().unwrap();
         let params_guard = self.norm_params.read().unwrap();
         if let (Some(model), Some(params)) = (&*model_guard, &*params_guard) {
-            let state = serde_json::json!({
-                "model": model,
-                "params": params
-            });
+            let state = SavedState {
+                model: model.clone(),
+                params: params.clone(),
+            };
             let json = serde_json::to_string(&state)?;
-            std::fs::write(path, json).map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
+            std::fs::write(path, json)
+                .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
         } else {
             return Err(anyhow::anyhow!("No model or params to save"));
         }
@@ -47,11 +54,9 @@ impl AppState {
 
     fn load_model_json(&self, path: &str) -> anyhow::Result<()> {
         let model_data = std::fs::read_to_string(path)?;
-        let v: serde_json::Value = serde_json::from_str(&model_data)?;
-        let model: Svm<f64, bool> = serde_json::from_value(v["model"].clone())?;
-        let params: NormalizationParams = serde_json::from_value(v["params"].clone())?;
-        *self.model.write().unwrap() = Some(model);
-        *self.norm_params.write().unwrap() = Some(params);
+        let state: SavedState = serde_json::from_str(&model_data)?;
+        *self.model.write().unwrap() = Some(state.model);
+        *self.norm_params.write().unwrap() = Some(state.params);
         log::info!("Model loaded successfully from {}", path);
         Ok(())
     }
@@ -223,7 +228,7 @@ fn process_prediction_request(
     params: &Option<NormalizationParams>,
 ) -> PredictionResponse {
     let start_time = Instant::now();
-    
+
     // Si no hay modelo entrenado, devolver respuesta por defecto
     if model.is_none() {
         return PredictionResponse {
@@ -235,13 +240,17 @@ fn process_prediction_request(
         };
     }
 
-    let discharges = request.discharges.iter().map(|d| {
-        InternalDischarge::new(
-            DisruptionClass::Unknown, // La clase es desconocida en predicción
-            api_discharge_to_internal_signals(d),
-        )
-    }).collect::<Vec<_>>();
-    
+    let discharges = request
+        .discharges
+        .iter()
+        .map(|d| {
+            InternalDischarge::new(
+                DisruptionClass::Unknown, // La clase es desconocida en predicción
+                api_discharge_to_internal_signals(d),
+            )
+        })
+        .collect::<Vec<_>>();
+
     if params.is_none() {
         return PredictionResponse {
             prediction: -1,
@@ -253,18 +262,21 @@ fn process_prediction_request(
     }
 
     let dataset = get_dataset(discharges, params.as_ref().unwrap());
-    
+
     // Realizar predicción con el modelo
-    let predictions = model.as_ref().unwrap()
-        .predict(&dataset);
-    
+    let predictions = model.as_ref().unwrap().predict(&dataset);
+
     // Determinar si hay anomalía (true representa anomalía)
     let anomaly_count = predictions.iter().filter(|&&p| p).count();
     let total = predictions.len();
-    let confidence = if total > 0 { anomaly_count as f64 / total as f64 } else { 0.0 };
-    
+    let confidence = if total > 0 {
+        anomaly_count as f64 / total as f64
+    } else {
+        0.0
+    };
+
     let prediction = if confidence > 0.5 { 1 } else { 0 };
-    
+
     PredictionResponse {
         prediction,
         confidence,
@@ -277,7 +289,9 @@ fn process_prediction_request(
 }
 
 /// Procesa una petición de entrenamiento
-fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm<f64, bool>, NormalizationParams) {
+fn process_training_request(
+    request: &TrainingRequest,
+) -> (TrainingResponse, Svm<f64, bool>, NormalizationParams) {
     // Convertir todas las descargas y señales al formato interno
     let start_time = Instant::now();
 
@@ -354,7 +368,8 @@ async fn train(req: web::Json<TrainingRequest>, app_state: web::Data<AppState>) 
     let (response, model, params) = process_training_request(&req);
 
     {
-        let mut model_lock: std::sync::RwLockWriteGuard<'_, Option<Svm<f64, bool>>> = app_state.model.write().unwrap();
+        let mut model_lock: std::sync::RwLockWriteGuard<'_, Option<Svm<f64, bool>>> =
+            app_state.model.write().unwrap();
         *model_lock = Some(model);
     }
     {
@@ -365,7 +380,7 @@ async fn train(req: web::Json<TrainingRequest>, app_state: web::Data<AppState>) 
     // Save the trained model to a file
     let model_path = MODEL_PATH;
     let res = app_state.save_model_json(model_path);
-    
+
     if res.is_err() {
         log::warn!("Unable to save model")
     }
@@ -427,34 +442,32 @@ async fn main() -> std::io::Result<()> {
     }
 
     let json_config = web::JsonConfig::default()
-        .limit(1 << 26)  // Tamaño max de 2^26 bytes (64 MB)
+        .limit(1 << 26) // Tamaño max de 2^26 bytes (64 MB)
         .error_handler(|err, _req| {
             log::error!("JSON payload error: {}", err);
             actix_web::error::InternalError::from_response(
-                err, 
+                err,
                 HttpResponse::BadRequest()
-                    .json(serde_json::json!({"error": "Payload too large or malformed"}))
-            ).into()
+                    .json(serde_json::json!({"error": "Payload too large or malformed"})),
+            )
+            .into()
         });
 
     log::info!("Starting SVM model server on http://0.0.0.0:8001");
     log::info!("Health check server on http://0.0.0.0:3001");
-
 
     // Start the health check server in a separate thread
     std::thread::spawn(|| {
         // Use the system runtime for the health check server
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            HttpServer::new(|| {
-                App::new().service(health_check)
-            })
-            .workers(1) // Use only one worker for health checks
-            .bind(("0.0.0.0", 3001))
-            .unwrap()
-            .run()
-            .await
-            .unwrap();
+            HttpServer::new(|| App::new().service(health_check))
+                .workers(1) // Use only one worker for health checks
+                .bind(("0.0.0.0", 3001))
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
         });
     });
 
@@ -462,7 +475,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .app_data(json_config.clone())  // Aplicar configuración de tamaño JSON
+            .app_data(json_config.clone()) // Aplicar configuración de tamaño JSON
             .service(predict)
             .service(train)
     })
