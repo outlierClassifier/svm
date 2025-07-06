@@ -2,10 +2,10 @@ use std::{collections::HashMap, hash::Hash};
 
 use linfa::Dataset;
 use ndarray::{Array1, Array2, Ix1};
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::{num_complex::Complex, FftPlanner};
 use serde::Deserialize;
 
-const WINDOW_SIZE: usize = 16;
+pub const WINDOW_SIZE: usize = 16;
 
 pub struct Discharge {
     pub class: DisruptionClass,
