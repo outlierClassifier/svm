@@ -2,8 +2,7 @@ mod signals;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono::{DateTime, Utc};
-use log::info;
-use log::warn;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use signals::get_dataset;
 use std::sync::RwLock;
@@ -13,10 +12,7 @@ use uuid::Uuid;
 use linfa::prelude::*;
 use linfa_svm::Svm;
 
-use crate::signals::Discharge as InternalDischarge;
-use crate::signals::DisruptionClass;
-use crate::signals::Signal as InternalSignal;
-use crate::signals::SignalType;
+use crate::signals::{DisruptionClass, Signal as InternalSignal, Discharge as InternalDischarge, SignalType, WINDOW_SIZE};
 
 // Startup time for uptime calculation
 static mut START_TIME: Option<Instant> = None;
