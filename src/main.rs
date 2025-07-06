@@ -250,6 +250,8 @@ fn process_prediction_request(
     model: &Option<Svm<f64, bool>>,
 ) -> PredictionResponse {
     let start_time = Instant::now();
+    let mut window_props: Vec<WindowProperties> = Vec::new();
+
     log::info!(
         "Received prediction request for discharge ID: {}",
         discharge.id
@@ -263,6 +265,8 @@ fn process_prediction_request(
             confidence: 0.0,
             execution_time_ms: 0.0,
             model: "none".to_string(),
+            window_size: WINDOW_SIZE,
+            windows: vec![],
         };
     }
 
@@ -291,11 +295,22 @@ fn process_prediction_request(
         "Normal"
     };
 
+    for (i, signal) in dataset.records.axis_iter(ndarray::Axis(0)).enumerate() {
+        let distance = model.as_ref().unwrap().weighted_sum(&signal.to_owned()) - model.as_ref().unwrap().rho;
+        window_props.push(WindowProperties {
+            feature_values: signal.to_vec(),
+            prediction: if predictions[i] { "Anomaly".to_string() } else { "Normal".to_string() },
+            distance,
+        });
+    }
+
     PredictionResponse {
         prediction: prediction.to_string(),
         confidence,
         execution_time_ms: start_time.elapsed().as_millis() as f64,
         model: "svm".to_string(),
+        window_size: WINDOW_SIZE,
+        windows: window_props,
     }
 }
 
