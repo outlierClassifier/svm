@@ -3,7 +3,7 @@ use std::{collections::HashMap, hash::Hash};
 use linfa::Dataset;
 use ndarray::{Array1, Array2, Ix1};
 use rustfft::{num_complex::Complex, FftPlanner};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const WINDOW_SIZE: usize = 16;
 
@@ -30,7 +30,7 @@ pub enum DisruptionClass {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, Hash, PartialEq)]
 pub enum SignalType {
     CorrientePlasma,
     ModeLock,
@@ -45,6 +45,11 @@ impl SignalType {
     pub fn count() -> usize {
         7
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NormalizationParams {
+    pub by_type: HashMap<SignalType, (f64, f64)>,
 }
 
 #[derive(Debug)]
@@ -164,6 +169,41 @@ impl Signal {
         signals_norm
     }
 
+    pub fn normalize_vec_with_params(
+        signals: Vec<Signal>,
+        params: &NormalizationParams,
+    ) -> Vec<Signal> {
+        let mut signals_norm = Vec::new();
+
+        for signal in signals {
+            if let Some((global_min, global_max)) = params.by_type.get(&signal.signal_type) {
+                let mut values_norm = Vec::with_capacity(signal.values.len());
+                for value in signal.values {
+                    let value_norm = (value - global_min) / (global_max - global_min);
+                    values_norm.push(value_norm);
+                }
+
+                let local_min = values_norm.iter().fold(f64::MAX, |a, b| a.min(*b));
+                let local_max = values_norm.iter().fold(f64::MIN, |a, b| a.max(*b));
+
+                signals_norm.push(Signal {
+                    label: signal.label,
+                    _times: signal._times,
+                    values: values_norm,
+                    class: signal.class,
+                    signal_type: signal.signal_type,
+                    min: local_min,
+                    max: local_max,
+                });
+            } else {
+                // If no parameters found, push signal without modification
+                signals_norm.push(signal);
+            }
+        }
+
+        signals_norm
+    }
+
     /// Calcula las características de la señal en ventanas de tamaño `window_size`.
     /// Devuelve dos vectores con los valores medios y desviaciones estándar de la FFT.
     /// **Se asume que la señal ya está normalizada.**
@@ -240,7 +280,26 @@ impl Discharge {
     }
 }
 
-pub fn get_dataset(discharges: Vec<Discharge>) -> Dataset<f64, bool, Ix1> {
+pub fn compute_normalization_params(discharges: &[Discharge]) -> NormalizationParams {
+    let mut map: HashMap<SignalType, (f64, f64)> = HashMap::new();
+
+    for discharge in discharges {
+        for signal in &discharge.signals {
+            let entry = map
+                .entry(signal.signal_type.clone())
+                .or_insert((f64::MAX, f64::MIN));
+            entry.0 = entry.0.min(signal.min);
+            entry.1 = entry.1.max(signal.max);
+        }
+    }
+
+    NormalizationParams { by_type: map }
+}
+
+pub fn get_dataset(
+    discharges: Vec<Discharge>,
+    params: &NormalizationParams,
+) -> Dataset<f64, bool, Ix1> {
     // Process each discharge separately and combine the results
     let mut all_records = Vec::new();
     let mut all_targets = Vec::new();
@@ -248,7 +307,7 @@ pub fn get_dataset(discharges: Vec<Discharge>) -> Dataset<f64, bool, Ix1> {
     for discharge in &discharges {
         // Normalize signals for this discharge
         let discharge_signals = discharge.signals.clone();
-        let normalized_signals = Signal::normalize_vec(discharge_signals);
+        let normalized_signals = Signal::normalize_vec_with_params(discharge_signals, params);
 
         // Process signals by type for this discharge
         let mut features_by_type: HashMap<SignalType, (Vec<f64>, Vec<f64>)> = HashMap::new();

@@ -4,7 +4,7 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use signals::get_dataset;
+use signals::{get_dataset, compute_normalization_params, NormalizationParams};
 use std::sync::RwLock;
 use std::time::Instant;
 use uuid::Uuid;
@@ -28,18 +28,26 @@ struct AppState {
     model: RwLock<Option<Svm<f64, bool>>>,
     training: RwLock<Option<TrainingSession>>,
     last_training: RwLock<Option<DateTime<Utc>>>,
+    normalization_params: RwLock<Option<NormalizationParams>>,
     http_client: reqwest::Client,
 }
 
 impl AppState {
     fn save_model_json(&self, path: &str) -> anyhow::Result<()> {
         let model = self.model.read().unwrap();
-        if let Some(model) = &*model {
-            let json = serde_json::to_string(model)?;
+        let params = self.normalization_params.read().unwrap();
+        if let (Some(model), Some(params)) = (&*model, &*params) {
+            #[derive(Serialize)]
+            struct ModelFile<'a> {
+                model: &'a Svm<f64, bool>,
+                params: &'a NormalizationParams,
+            }
+            let data = ModelFile { model, params };
+            let json = serde_json::to_string(&data)?;
             std::fs::write(path, json)
                 .map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
         } else {
-            return Err(anyhow::anyhow!("No model to save"));
+            return Err(anyhow::anyhow!("No model or params to save"));
         }
 
         log::info!("Model saved successfully to {}", path);
@@ -48,9 +56,16 @@ impl AppState {
     }
 
     fn load_model_json(&self, path: &str) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct ModelFile {
+            model: Svm<f64, bool>,
+            params: NormalizationParams,
+        }
+
         let model_data = std::fs::read_to_string(path)?;
-        let model: Svm<f64, bool> = serde_json::from_str(&model_data)?;
-        *self.model.write().unwrap() = Some(model);
+        let model_file: ModelFile = serde_json::from_str(&model_data)?;
+        *self.model.write().unwrap() = Some(model_file.model);
+        *self.normalization_params.write().unwrap() = Some(model_file.params);
         log::info!("Model loaded successfully from {}", path);
         Ok(())
     }
@@ -248,6 +263,7 @@ fn api_discharge_to_internal_signals(discharge: &Discharge) -> Vec<InternalSigna
 fn process_prediction_request(
     discharge: &Discharge,
     model: &Option<Svm<f64, bool>>,
+    params: Option<&NormalizationParams>,
 ) -> PredictionResponse {
     let start_time = Instant::now();
     let mut window_props: Vec<WindowProperties> = Vec::new();
@@ -258,7 +274,7 @@ fn process_prediction_request(
     );
     
     // If no model is loaded, return unknown prediction
-    if model.is_none() {
+    if model.is_none() || params.is_none() {
         log::warn!("No model loaded, returning unknown prediction");
         return PredictionResponse {
             prediction: "Unknown".to_string(),
@@ -275,7 +291,7 @@ fn process_prediction_request(
         api_discharge_to_internal_signals(discharge),
     )];
 
-    let dataset = get_dataset(discharges);
+    let dataset = get_dataset(discharges, params.unwrap());
 
     // Realizar predicción con el modelo
     let predictions = model.as_ref().unwrap().predict(&dataset);
@@ -315,7 +331,9 @@ fn process_prediction_request(
 }
 
 /// Procesa una petición de entrenamiento
-fn process_training_request(discharges: &[Discharge]) -> (TrainingResponse, Svm<f64, bool>) {
+fn process_training_request(
+    discharges: &[Discharge],
+) -> (TrainingResponse, Svm<f64, bool>, NormalizationParams) {
     // Convertir todas las descargas y señales al formato interno
     let start_time = Instant::now();
 
@@ -332,12 +350,9 @@ fn process_training_request(discharges: &[Discharge]) -> (TrainingResponse, Svm<
         })
         .collect::<Vec<_>>();
 
-    let mut all_signals = Vec::new();
-    for discharge in &discharges {
-        all_signals.extend(discharge.signals.clone());
-    }
+    let params = compute_normalization_params(&discharges);
 
-    let dataset = get_dataset(discharges);
+    let dataset = get_dataset(discharges, &params);
 
     let model: Svm<f64, bool> = Svm::<f64, bool>::params()
         .gaussian_kernel(10.)
@@ -366,7 +381,7 @@ fn process_training_request(discharges: &[Discharge]) -> (TrainingResponse, Svm<
         execution_time_ms,
     };
 
-    (response, model)
+    (response, model, params)
 }
 
 // API endpoints
@@ -374,7 +389,8 @@ fn process_training_request(discharges: &[Discharge]) -> (TrainingResponse, Svm<
 #[post("/predict")]
 async fn predict(req: web::Json<Discharge>, app_state: web::Data<AppState>) -> impl Responder {
     let model = app_state.model.read().unwrap();
-    let response = process_prediction_request(&req, &model);
+    let params_guard = app_state.normalization_params.read().unwrap();
+    let response = process_prediction_request(&req, &model, params_guard.as_ref());
     HttpResponse::Ok().json(response)
 }
 
@@ -420,10 +436,14 @@ async fn push_discharge(
         if ordinal == total {
             let discharges = training_lock.take().unwrap().discharges;
             drop(training_lock);
-            let (response, model) = process_training_request(&discharges);
+            let (response, model, params) = process_training_request(&discharges);
             {
                 let mut model_lock = app_state.model.write().unwrap();
                 *model_lock = Some(model);
+            }
+            {
+                let mut params_lock = app_state.normalization_params.write().unwrap();
+                *params_lock = Some(params);
             }
             let _ = app_state.save_model_json(MODEL_PATH);
             *app_state.last_training.write().unwrap() = Some(Utc::now());
@@ -491,6 +511,7 @@ async fn main() -> std::io::Result<()> {
         model: RwLock::new(None),
         training: RwLock::new(None),
         last_training: RwLock::new(None),
+        normalization_params: RwLock::new(None),
         http_client: reqwest::Client::new(),
     });
 
