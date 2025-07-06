@@ -135,6 +135,19 @@ struct PredictionResponse {
     #[serde(rename = "executionTimeMs")]
     execution_time_ms: f64,
     model: String,
+    #[serde(rename = "windowSize")]
+    window_size: usize,
+    #[serde(rename = "windows")]
+    windows: Vec<WindowProperties>,
+}
+
+#[derive(Serialize)]
+struct WindowProperties {
+    #[serde(rename = "featureValues")]
+    feature_values: Vec<f64>,
+    prediction: String,
+    #[serde(rename = "justification")]
+    distance: f64,  // In SVM, the justification is the distance to the hyperplane
 }
 
 #[derive(Deserialize)]
