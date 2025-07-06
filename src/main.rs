@@ -3,7 +3,7 @@ mod signals;
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use signals::get_dataset;
+use signals::{get_dataset, NormalizationParams};
 use std::sync::RwLock;
 use std::time::Instant;
 use uuid::Uuid;
@@ -22,16 +22,22 @@ const MODEL_PATH: &str = "trained_svm_model.json";
 
 struct AppState {
     model: RwLock<Option<Svm<f64, bool>>>,
+    norm_params: RwLock<Option<NormalizationParams>>, 
 }
 
 impl AppState {
     fn save_model_json(&self, path: &str) -> anyhow::Result<()> {
-        let model = self.model.read().unwrap();
-        if let Some(model) = &*model {
-            let json = serde_json::to_string(model)?;
+        let model_guard = self.model.read().unwrap();
+        let params_guard = self.norm_params.read().unwrap();
+        if let (Some(model), Some(params)) = (&*model_guard, &*params_guard) {
+            let state = serde_json::json!({
+                "model": model,
+                "params": params
+            });
+            let json = serde_json::to_string(&state)?;
             std::fs::write(path, json).map_err(|e| anyhow::anyhow!("Failed to save model: {}", e))?;
         } else {
-            return Err(anyhow::anyhow!("No model to save"));
+            return Err(anyhow::anyhow!("No model or params to save"));
         }
 
         log::info!("Model saved successfully to {}", path);
@@ -41,11 +47,14 @@ impl AppState {
 
     fn load_model_json(&self, path: &str) -> anyhow::Result<()> {
         let model_data = std::fs::read_to_string(path)?;
-        let model: Svm<f64, bool> = serde_json::from_str(&model_data)?;
+        let v: serde_json::Value = serde_json::from_str(&model_data)?;
+        let model: Svm<f64, bool> = serde_json::from_value(v["model"].clone())?;
+        let params: NormalizationParams = serde_json::from_value(v["params"].clone())?;
         *self.model.write().unwrap() = Some(model);
+        *self.norm_params.write().unwrap() = Some(params);
         log::info!("Model loaded successfully from {}", path);
         Ok(())
-    }    
+    }
 }
 
 // Data structures based on API schema
@@ -211,6 +220,7 @@ fn api_discharge_to_internal_signals(discharge: &Discharge) -> Vec<InternalSigna
 fn process_prediction_request(
     request: &PredictionRequest,
     model: &Option<Svm<f64, bool>>,
+    params: &Option<NormalizationParams>,
 ) -> PredictionResponse {
     let start_time = Instant::now();
     
@@ -232,7 +242,17 @@ fn process_prediction_request(
         )
     }).collect::<Vec<_>>();
     
-    let dataset = get_dataset(discharges);
+    if params.is_none() {
+        return PredictionResponse {
+            prediction: -1,
+            confidence: 0.0,
+            execution_time_ms: 0.0,
+            model: "none".to_string(),
+            details: serde_json::json!({ "error": "No normalization parameters" }),
+        };
+    }
+
+    let dataset = get_dataset(discharges, params.as_ref().unwrap());
     
     // Realizar predicción con el modelo
     let predictions = model.as_ref().unwrap()
@@ -257,7 +277,7 @@ fn process_prediction_request(
 }
 
 /// Procesa una petición de entrenamiento
-fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm<f64, bool>) {
+fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm<f64, bool>, NormalizationParams) {
     // Convertir todas las descargas y señales al formato interno
     let start_time = Instant::now();
 
@@ -280,7 +300,10 @@ fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm
         all_signals.extend(discharge.signals.clone());
     }
 
-    let dataset = get_dataset(discharges);
+    // Compute normalization parameters using all signals
+    let (_, params) = InternalSignal::normalize_vec(all_signals, None);
+
+    let dataset = get_dataset(discharges, &params);
 
     let model: Svm<f64, bool> = Svm::<f64, bool>::params()
         .gaussian_kernel(10.)
@@ -309,7 +332,7 @@ fn process_training_request(request: &TrainingRequest) -> (TrainingResponse, Svm
         execution_time_ms,
     };
 
-    (response, model)
+    (response, model, params)
 }
 
 // API endpoints
@@ -320,19 +343,24 @@ async fn predict(
     app_state: web::Data<AppState>,
 ) -> impl Responder {
     let model = app_state.model.read().unwrap();
-    let response = process_prediction_request(&req, &model);
+    let params = app_state.norm_params.read().unwrap();
+    let response = process_prediction_request(&req, &model, &params);
     HttpResponse::Ok().json(response)
 }
 
 #[post("/train")]
 async fn train(req: web::Json<TrainingRequest>, app_state: web::Data<AppState>) -> impl Responder {
     println!("Received training petition");
-    let (response, model) = process_training_request(&req);
+    let (response, model, params) = process_training_request(&req);
 
     {
         let mut model_lock: std::sync::RwLockWriteGuard<'_, Option<Svm<f64, bool>>> = app_state.model.write().unwrap();
         *model_lock = Some(model);
-    } // When model_lock goes out of scope, the lock is released
+    }
+    {
+        let mut params_lock = app_state.norm_params.write().unwrap();
+        *params_lock = Some(params);
+    }
 
     // Save the trained model to a file
     let model_path = MODEL_PATH;
@@ -388,6 +416,7 @@ async fn main() -> std::io::Result<()> {
 
     let app_state = web::Data::new(AppState {
         model: RwLock::new(None),
+        norm_params: RwLock::new(None),
     });
 
     // Try to load model
